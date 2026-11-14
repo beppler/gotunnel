@@ -38,10 +38,12 @@ No linters or code generators are configured; stdlib + two deps only
   `${ENV}` expansion.
 - `internal/dest/` — shared host/port validation helpers (used by both
   sides).
+- `internal/handshake/` — the single signed handshake message (JSON +
+  HMAC-SHA256), shared by both sides.
 - `internal/tunnel/` — the byte pipe between a WebSocket and a duplex
   stream (`Pump`, `Drain`). All framing lives here.
-- `internal/server/` — WS server: auth → limits → allowlist → upgrade
-  → dial → pump.
+- `internal/server/` — WS server: limits → upgrade → verify signed
+  handshake → allowlist → dial → pump.
 - `internal/client/` — `client.go` (wss dialer + keepalive),
   `httpproxy.go` (CONNECT + absolute-URI), `stdio.go` (ssh
   ProxyCommand).
@@ -59,22 +61,25 @@ README:
   configurable via the config's `listen` key). Non-loopback addresses
   expose the endpoint beyond localhost; the shared key remains the
   access control.
-- **Auth**: the shared key is sent as the **first WebSocket message**
-  after the upgrade (never an HTTP header or URL part), sha256-hashed
-  then constant-time-compared. A missing, wrong or malformed key gets
-  the same opaque `unauthorized` rejection.
-- **Destination** is sent by the client as the **second** WebSocket
-  message after the upgrade, right after the key (`host`, `host:port`
-  or `[v6]:port`; default port 80) — never in the handshake URL or
-  headers. Constrained by the
-  optional `allow` glob list (checked after the upgrade, before
-  dialing). The server replies with a single `ok` message only after
-  the upstream dial succeeds; any other message carries the reason the
-  tunnel was not established (auth failure, policy rejection or dial
-  failure, including the cause) and is followed by a close frame
+- **Auth + destination in one signed message.** The client sends a
+  **single** JSON message right after the upgrade:
+  `{"v":1,"host":...,"port":...,"sig":...}` where `sig` is
+  `hex(HMAC-SHA256(key, "host:port"))` (`internal/handshake`). The
+  key itself is **never** transmitted; the server verifies the HMAC
+  in constant time (`hmac.Equal`). A missing, malformed,
+  wrong-version or wrongly signed message gets the same opaque
+  `unauthorized` rejection.
+- **Destination** travels inside that signed message (`host`,
+  `host:port` or `[v6]:port`; default port 80) — never in the
+  handshake URL or headers. Constrained by the optional `allow` glob
+  list (checked after the upgrade, before dialing). The server
+  replies with a single `ok` message only after the upstream dial
+  succeeds; any other message carries the reason the tunnel was not
+  established (auth failure, policy rejection or dial failure,
+  including the cause) and is followed by a close frame
   (`tunnel.AckOK` is the shared framing constant). Client handshake
   timeouts must exceed the server's `dial_timeout`. If the client
-  never sends the key or destination, the server closes the tunnel
+  never sends the handshake message, the server closes the tunnel
   after ~5 s with the same failure treatment.
 - **Teardown semantics**: in `tunnel.Pump`, the first direction to
   finish tears the tunnel down (WS has no half-close). Keepalive pings

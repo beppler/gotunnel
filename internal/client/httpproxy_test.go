@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,7 +15,6 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gotunnel/internal/dest"
 	"gotunnel/internal/tunnel"
 )
 
@@ -24,18 +22,9 @@ import (
 // is an HTTP origin: it acks the tunnel, captures the forwarded
 // request (head plus optional body), replies with a canned response
 // and closes the tunnel.
-func responderTunnelHandler(response []byte, got func(head []byte, body []byte)) func(ctx context.Context, conn *websocket.Conn) {
-	return func(_ context.Context, conn *websocket.Conn) {
+func responderTunnelHandler(response []byte, got func(head []byte, body []byte)) func(ctx context.Context, conn *websocket.Conn, host string, port int) {
+	return func(_ context.Context, conn *websocket.Conn, _ string, _ int) {
 		ctx := context.Background()
-		typ, data, err := conn.Read(ctx)
-		if err != nil || typ != websocket.MessageBinary {
-			rejectTunnel(ctx, conn, errors.New("destination message not received"))
-			return
-		}
-		if _, _, err := dest.ParseAddress(string(data), 80); err != nil {
-			rejectTunnel(ctx, conn, err)
-			return
-		}
 		if err := conn.Write(ctx, websocket.MessageBinary, []byte(tunnel.AckOK)); err != nil {
 			return
 		}
@@ -64,17 +53,9 @@ func responderTunnelHandler(response []byte, got func(head []byte, body []byte))
 
 // closeAfterRequestHandler acks the tunnel, reads the forwarded
 // request, then closes with a reason instead of relaying a response.
-func closeAfterRequestHandler(status websocket.StatusCode, reason string) func(ctx context.Context, conn *websocket.Conn) {
-	return func(_ context.Context, conn *websocket.Conn) {
+func closeAfterRequestHandler(status websocket.StatusCode, reason string) func(ctx context.Context, conn *websocket.Conn, host string, port int) {
+	return func(_ context.Context, conn *websocket.Conn, _ string, _ int) {
 		ctx := context.Background()
-		_, data, err := conn.Read(ctx)
-		if err != nil {
-			return
-		}
-		if _, _, err := dest.ParseAddress(string(data), 80); err != nil {
-			rejectTunnel(ctx, conn, err)
-			return
-		}
 		if err := conn.Write(ctx, websocket.MessageBinary, []byte(tunnel.AckOK)); err != nil {
 			return
 		}

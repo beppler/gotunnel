@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
@@ -18,13 +16,14 @@ import (
 
 	"gotunnel/internal/config"
 	"gotunnel/internal/dest"
+	"gotunnel/internal/handshake"
 	"gotunnel/internal/tunnel"
 )
 
 const (
-	// destWait bounds how long the server waits for each handshake
-	// message (key, then destination) after the upgrade; clients send
-	// them immediately.
+	// destWait bounds how long the server waits for the single
+	// handshake message (destination + signature) after the upgrade;
+	// clients send it immediately.
 	destWait = 5 * time.Second
 	// ackWait bounds the server's own control writes (ack/rejection)
 	// before the pump starts.
@@ -32,17 +31,18 @@ const (
 )
 
 // errUnauthorized is the only rejection surfaced before the client
-// proves the shared key: a missing, wrong or malformed key message is
-// indistinguishable from the outside.
+// proves knowledge of the shared key: a missing, malformed, wrong
+// version or wrongly signed handshake message is indistinguishable
+// from the outside.
 var errUnauthorized = errors.New("unauthorized")
 
 // Server is a gotunnel server: it authenticates WebSocket clients,
 // enforces the destination allowlist and relays each tunnel (one
 // WebSocket per connection) to its destination.
 type Server struct {
-	cfg     config.ServerConfig
-	keyHash [sha256.Size]byte
-	conns   atomic.Int64
+	cfg   config.ServerConfig
+	key   string
+	conns atomic.Int64
 }
 
 // New creates a Server.
@@ -50,9 +50,7 @@ func New(cfg config.ServerConfig) (*Server, error) {
 	if cfg.Key == "" {
 		return nil, errors.New("server: key is required")
 	}
-	s := &Server{cfg: cfg}
-	s.keyHash = sha256.Sum256([]byte(cfg.Key))
-	return s, nil
+	return &Server{cfg: cfg, key: cfg.Key}, nil
 }
 
 // Handler returns the http.Handler serving the WebSocket endpoint.
@@ -69,9 +67,9 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Clients are not browsers; the shared key, sent as the first
-		// WebSocket message, is the authentication mechanism, so skip
-		// the origin check.
+		// Clients are not browsers; the HMAC-signed handshake message,
+		// sent as the first WebSocket message, is the authentication
+		// mechanism, so skip the origin check.
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
@@ -80,12 +78,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.conns.Add(1)
 	defer s.conns.Add(-1)
 
-	if err := s.readKey(conn); err != nil {
-		s.reject(conn, err)
-		return
-	}
-
-	host, port, err := s.readDest(conn)
+	host, port, err := s.readHandshake(conn)
 	if err == nil && !s.destAllowed(host, port) {
 		err = errors.New("destination not allowed")
 	}
@@ -122,53 +115,34 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	tunnel.Pump(ctx, conn, ac)
 }
 
-// authOK compares the presented key against the configured one in
-// constant time (both sides are hashed first so timing does not depend
-// on the key length).
-func (s *Server) authOK(presented string) bool {
-	sum := sha256.Sum256([]byte(presented))
-	return subtle.ConstantTimeCompare(sum[:], s.keyHash[:]) == 1
-}
-
-// readKey waits for the first post-upgrade message and checks it
-// against the shared key. Every failure — a missing, wrong, malformed
-// or non-binary message, or a client that never speaks — yields the
-// same opaque errUnauthorized.
-func (s *Server) readKey(conn *websocket.Conn) error {
-	// A client that never sends the key gets the same opaque
-	// rejection; closing from a timer (instead of canceling the read
-	// context) keeps the close handshake intact.
+// readHandshake reads the single post-upgrade message: a JSON object
+// carrying the destination and an HMAC-SHA256 signature over it,
+// keyed by the shared key — so the key itself never crosses the wire.
+// It first authenticates the message, then parses the destination.
+// Every authentication failure — a missing, malformed, non-binary,
+// wrong-version or wrongly signed message, or a client that never
+// speaks — yields the same opaque errUnauthorized; destination
+// parsing failures are only surfaced to an authenticated client.
+func (s *Server) readHandshake(conn *websocket.Conn) (host string, port int, err error) {
+	// A client that never sends the handshake message gets the same
+	// opaque rejection; closing from a timer (instead of canceling
+	// the read context) keeps the close handshake intact.
 	t := time.AfterFunc(destWait, func() { s.reject(conn, errUnauthorized) })
 	defer t.Stop()
 
 	typ, data, err := conn.Read(context.Background())
-	if err != nil || typ != websocket.MessageBinary || !s.authOK(string(data)) {
-		return errUnauthorized
+	if err != nil || typ != websocket.MessageBinary {
+		return "", 0, errUnauthorized
 	}
-	return nil
-}
-
-// readDest reads the tunnel destination from the second post-upgrade
-// message (the first carries the key), so neither ever crosses the
-// HTTP layer (no query params, no headers).
-func (s *Server) readDest(conn *websocket.Conn) (host string, port int, err error) {
-	// An authenticated client that never sends the destination
-	// message gets the same rejection treatment (reason message +
-	// close frame); closing from a timer keeps the close handshake
-	// intact.
-	t := time.AfterFunc(destWait, func() {
-		s.reject(conn, errors.New("destination message not received"))
-	})
-	defer t.Stop()
-
-	typ, data, err := conn.Read(context.Background())
+	host, port, err = handshake.Verify(data, s.key)
 	if err != nil {
-		return "", 0, fmt.Errorf("read destination: %w", err)
+		return "", 0, errUnauthorized
 	}
-	if typ != websocket.MessageBinary {
-		return "", 0, errors.New("destination message is not binary")
+	host, port, err = dest.ParseAddress(dest.Join(host, port), 80)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid destination: %w", err)
 	}
-	return dest.ParseAddress(string(data), 80)
+	return host, port, nil
 }
 
 // reject informs the client that the tunnel was not established (a

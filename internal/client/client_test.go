@@ -17,6 +17,7 @@ import (
 	"github.com/coder/websocket"
 
 	"gotunnel/internal/dest"
+	"gotunnel/internal/handshake"
 	"gotunnel/internal/tunnel"
 )
 
@@ -79,9 +80,12 @@ func trustTestCert(t *testing.T, ts *httptest.Server) {
 }
 
 // newFakeTunnel starts an httptest TLS server speaking the gotunnel
-// protocol: after the upgrade, handle owns the WebSocket connection
-// for as long as the tunnel lives. It returns the wss:// URL.
-func newFakeTunnel(t *testing.T, key string, handle func(ctx context.Context, conn *websocket.Conn)) string {
+// protocol: after the upgrade, it reads the single handshake message,
+// verifies its HMAC signature under key (a missing, wrong or
+// malformed message gets the same rejection as the real server's) and
+// then hands the connection plus the authenticated destination to
+// handle for as long as the tunnel lives. It returns the wss:// URL.
+func newFakeTunnel(t *testing.T, key string, handle func(ctx context.Context, conn *websocket.Conn, host string, port int)) string {
 	t.Helper()
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -90,18 +94,16 @@ func newFakeTunnel(t *testing.T, key string, handle func(ctx context.Context, co
 		if err != nil {
 			return
 		}
-		// The shared key arrives as the first WebSocket message; a
-		// missing, wrong or malformed key gets the same rejection as
-		// the real server's.
 		ctx := context.Background()
-		ktyp, kdata, err := conn.Read(ctx)
-		if err != nil || ktyp != websocket.MessageBinary || string(kdata) != key {
+		typ, data, err := conn.Read(ctx)
+		host, port, verr := handshake.Verify(data, key)
+		if err != nil || typ != websocket.MessageBinary || verr != nil {
 			rejectTunnel(ctx, conn, errors.New("unauthorized"))
 			return
 		}
 		// The handler runs for the tunnel's lifetime; the request
 		// context would be canceled as soon as ServeHTTP returns.
-		handle(ctx, conn)
+		handle(ctx, conn, host, port)
 	}))
 	trustTestCert(t, ts)
 	t.Cleanup(ts.Close)
@@ -118,21 +120,10 @@ func rejectTunnel(ctx context.Context, conn *websocket.Conn, reason error) {
 }
 
 // echoTunnelHandler implements the server side of the protocol for an
-// echo destination: read the destination message, dial it, ack, then
-// pump bytes both ways.
-func echoTunnelHandler() func(ctx context.Context, conn *websocket.Conn) {
-	return func(_ context.Context, conn *websocket.Conn) {
+// echo destination: dial it, ack, then pump bytes both ways.
+func echoTunnelHandler() func(ctx context.Context, conn *websocket.Conn, host string, port int) {
+	return func(_ context.Context, conn *websocket.Conn, host string, port int) {
 		ctx := context.Background()
-		typ, data, err := conn.Read(ctx)
-		if err != nil || typ != websocket.MessageBinary {
-			rejectTunnel(ctx, conn, errors.New("destination message not received"))
-			return
-		}
-		host, port, err := dest.ParseAddress(string(data), 80)
-		if err != nil {
-			rejectTunnel(ctx, conn, err)
-			return
-		}
 		target, err := net.DialTimeout("tcp", dest.Join(host, port), 5*time.Second)
 		if err != nil {
 			rejectTunnel(ctx, conn, fmt.Errorf("upstream dial failed: %w", err))
@@ -146,26 +137,18 @@ func echoTunnelHandler() func(ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
-// rejectAfterDestHandler reads the destination message and rejects the
-// tunnel with a fixed reason.
-func rejectAfterDestHandler(reason string) func(ctx context.Context, conn *websocket.Conn) {
-	return func(_ context.Context, conn *websocket.Conn) {
-		ctx := context.Background()
-		if _, _, err := conn.Read(ctx); err != nil {
-			_ = conn.Close(websocket.StatusInternalError, "")
-			return
-		}
+// rejectTunnelHandler rejects the tunnel with a fixed reason without
+// dialing anything.
+func rejectTunnelHandler(reason string) func(ctx context.Context, conn *websocket.Conn, host string, port int) {
+	return func(ctx context.Context, conn *websocket.Conn, _ string, _ int) {
 		rejectTunnel(ctx, conn, errors.New(reason))
 	}
 }
 
 // slowAckHandler acks the tunnel only after a fixed delay.
-func slowAckHandler(delay time.Duration) func(ctx context.Context, conn *websocket.Conn) {
-	return func(_ context.Context, conn *websocket.Conn) {
+func slowAckHandler(delay time.Duration) func(ctx context.Context, conn *websocket.Conn, host string, port int) {
+	return func(_ context.Context, conn *websocket.Conn, _ string, _ int) {
 		ctx := context.Background()
-		if _, _, err := conn.Read(ctx); err != nil {
-			return
-		}
 		time.Sleep(delay)
 		_ = conn.Write(ctx, websocket.MessageBinary, []byte(tunnel.AckOK))
 		_ = conn.Close(websocket.StatusNormalClosure, "")
@@ -246,7 +229,7 @@ func TestDialHandshakeSuccess(t *testing.T) {
 }
 
 func TestDialSurfacesRejectionReason(t *testing.T) {
-	url := newFakeTunnel(t, testKey, rejectAfterDestHandler("destination not allowed"))
+	url := newFakeTunnel(t, testKey, rejectTunnelHandler("destination not allowed"))
 	_, err := Dial(context.Background(), Options{URL: url, Key: testKey, Host: "db.internal.example", Port: 22})
 	if err == nil || !strings.Contains(err.Error(), "destination not allowed") {
 		t.Fatalf("expected rejection reason in error, got %v", err)
@@ -284,12 +267,12 @@ func TestStartKeepalive(t *testing.T) {
 	// test can kill it later.
 	serverConn := make(chan *websocket.Conn, 1)
 	inner := echoTunnelHandler()
-	url := newFakeTunnel(t, testKey, func(ctx context.Context, conn *websocket.Conn) {
+	url := newFakeTunnel(t, testKey, func(ctx context.Context, conn *websocket.Conn, host string, port int) {
 		select {
 		case serverConn <- conn:
 		default:
 		}
-		inner(ctx, conn)
+		inner(ctx, conn, host, port)
 	})
 
 	host, port := echoAddr(t)

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -9,7 +10,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gotunnel/internal/dest"
+	"gotunnel/internal/handshake"
 	"gotunnel/internal/tunnel"
 )
 
@@ -25,12 +26,13 @@ type Options struct {
 	// server is always reached through a TLS-terminating reverse
 	// proxy.
 	URL string
-	// Key is the shared secret, sent as the first WebSocket message
-	// after the upgrade (never in the handshake URL or headers).
+	// Key is the shared secret. It never crosses the wire: it only
+	// keys the HMAC-SHA256 signature of the destination, sent as the
+	// single handshake message after the upgrade (never in the
+	// handshake URL or headers).
 	Key string
-	// Host and Port are the destination behind the server, sent as the
-	// second WebSocket message after the upgrade (right after the
-	// key).
+	// Host and Port are the destination behind the server, carried in
+	// the signed handshake message sent right after the upgrade.
 	Host string
 	Port int
 	// HandshakeTimeout bounds the WebSocket dial plus the server's
@@ -77,16 +79,17 @@ func Dial(ctx context.Context, o Options) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("connect to %s: %w", o.URL, err)
 	}
 
-	// The key and the destination travel as the first two messages on
-	// the tunnel, so neither ever appears in the request line, headers
-	// or reverse-proxy access logs.
-	if err := conn.Write(dctx, websocket.MessageBinary, []byte(o.Key)); err != nil {
+	// The destination travels as a single signed handshake message on
+	// the tunnel, so it and the key never appear in the request line,
+	// headers or reverse-proxy access logs.
+	data, err := json.Marshal(handshake.Sign(o.Host, o.Port, o.Key))
+	if err != nil {
 		_ = conn.Close(websocket.StatusInternalError, "")
-		return nil, fmt.Errorf("send key: %w", err)
+		return nil, fmt.Errorf("encode handshake message: %w", err)
 	}
-	if err := conn.Write(dctx, websocket.MessageBinary, []byte(dest.Join(o.Host, o.Port))); err != nil {
+	if err := conn.Write(dctx, websocket.MessageBinary, data); err != nil {
 		_ = conn.Close(websocket.StatusInternalError, "")
-		return nil, fmt.Errorf("send destination: %w", err)
+		return nil, fmt.Errorf("send handshake message: %w", err)
 	}
 
 	// The server replies with a single message once the destination
