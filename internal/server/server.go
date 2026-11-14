@@ -22,15 +22,19 @@ import (
 )
 
 const (
-	authHeader = "X-Gotunnel-Key"
-
-	// destWait bounds how long the server waits for the destination
-	// message after the upgrade; clients send it immediately.
+	// destWait bounds how long the server waits for each handshake
+	// message (key, then destination) after the upgrade; clients send
+	// them immediately.
 	destWait = 5 * time.Second
 	// ackWait bounds the server's own control writes (ack/rejection)
 	// before the pump starts.
 	ackWait = 5 * time.Second
 )
+
+// errUnauthorized is the only rejection surfaced before the client
+// proves the shared key: a missing, wrong or malformed key message is
+// indistinguishable from the outside.
+var errUnauthorized = errors.New("unauthorized")
 
 // Server is a gotunnel server: it authenticates WebSocket clients,
 // enforces the destination allowlist and relays each tunnel (one
@@ -59,18 +63,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.authOK(r.Header.Get(authHeader)) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
 	if max := s.cfg.MaxConcurrent; max > 0 && s.conns.Load() >= int64(max) {
 		http.Error(w, "too many concurrent tunnels", http.StatusServiceUnavailable)
 		return
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Clients are not browsers; the shared key is the
-		// authentication mechanism, so skip the origin check.
+		// Clients are not browsers; the shared key, sent as the first
+		// WebSocket message, is the authentication mechanism, so skip
+		// the origin check.
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
@@ -79,7 +80,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.conns.Add(1)
 	defer s.conns.Add(-1)
 
-	host, port, err := s.destFromConn(conn)
+	if err := s.readKey(conn); err != nil {
+		s.reject(conn, err)
+		return
+	}
+
+	host, port, err := s.readDest(conn)
 	if err == nil && !s.destAllowed(host, port) {
 		err = errors.New("destination not allowed")
 	}
@@ -124,14 +130,32 @@ func (s *Server) authOK(presented string) bool {
 	return subtle.ConstantTimeCompare(sum[:], s.keyHash[:]) == 1
 }
 
-// destFromConn reads the tunnel destination from the first WebSocket
-// message after the upgrade, so it never crosses the HTTP layer
-// (no query params, no headers).
-func (s *Server) destFromConn(conn *websocket.Conn) (host string, port int, err error) {
-	// A client that never sends the destination message gets the same
-	// rejection treatment (reason message + close frame); closing from
-	// a timer (instead of canceling the read context) keeps the close
-	// handshake intact.
+// readKey waits for the first post-upgrade message and checks it
+// against the shared key. Every failure — a missing, wrong, malformed
+// or non-binary message, or a client that never speaks — yields the
+// same opaque errUnauthorized.
+func (s *Server) readKey(conn *websocket.Conn) error {
+	// A client that never sends the key gets the same opaque
+	// rejection; closing from a timer (instead of canceling the read
+	// context) keeps the close handshake intact.
+	t := time.AfterFunc(destWait, func() { s.reject(conn, errUnauthorized) })
+	defer t.Stop()
+
+	typ, data, err := conn.Read(context.Background())
+	if err != nil || typ != websocket.MessageBinary || !s.authOK(string(data)) {
+		return errUnauthorized
+	}
+	return nil
+}
+
+// readDest reads the tunnel destination from the second post-upgrade
+// message (the first carries the key), so neither ever crosses the
+// HTTP layer (no query params, no headers).
+func (s *Server) readDest(conn *websocket.Conn) (host string, port int, err error) {
+	// An authenticated client that never sends the destination
+	// message gets the same rejection treatment (reason message +
+	// close frame); closing from a timer keeps the close handshake
+	// intact.
 	t := time.AfterFunc(destWait, func() {
 		s.reject(conn, errors.New("destination message not received"))
 	})

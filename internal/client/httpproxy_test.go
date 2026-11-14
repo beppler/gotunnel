@@ -261,8 +261,8 @@ func TestConnectKeyRequired(t *testing.T) {
 	rc := newRawClient(t, ts.Listener.Addr().String())
 	dest := net.JoinHostPort(host, strconv.Itoa(port))
 	rc.send("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", dest, dest)
-	if resp := rc.readRest(); !bytes.Contains(resp, []byte("401")) {
-		t.Fatalf("expected the server's 401 to surface as a 502, got %q", resp)
+	if resp := rc.readRest(); !bytes.Contains(resp, []byte("unauthorized")) {
+		t.Fatalf("expected the server's unauthorized rejection to surface as a 502, got %q", resp)
 	}
 }
 

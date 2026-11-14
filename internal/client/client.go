@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"time"
 
@@ -15,9 +14,6 @@ import (
 )
 
 const (
-	// AuthHeader carries the shared key in the WebSocket handshake.
-	AuthHeader = "X-Gotunnel-Key"
-
 	// KeepaliveInterval is how often the client pings the server so
 	// reverse proxies do not drop idle tunnels.
 	KeepaliveInterval = 30 * time.Second
@@ -29,11 +25,12 @@ type Options struct {
 	// server is always reached through a TLS-terminating reverse
 	// proxy.
 	URL string
-	// Key is the shared secret.
+	// Key is the shared secret, sent as the first WebSocket message
+	// after the upgrade (never in the handshake URL or headers).
 	Key string
-	// Host and Port are the destination behind the server, sent as
-	// the first message after the WebSocket upgrade (never in the
-	// handshake URL or headers).
+	// Host and Port are the destination behind the server, sent as the
+	// second WebSocket message after the upgrade (right after the
+	// key).
 	Host string
 	Port int
 	// HandshakeTimeout bounds the WebSocket dial plus the server's
@@ -70,12 +67,9 @@ func Dial(ctx context.Context, o Options) (*websocket.Conn, error) {
 		o.HandshakeTimeout = 30 * time.Second
 	}
 
-	hdr := http.Header{}
-	hdr.Set(AuthHeader, o.Key)
-
 	dctx, cancel := context.WithTimeout(ctx, o.HandshakeTimeout)
 	defer cancel()
-	conn, resp, err := websocket.Dial(dctx, o.URL, &websocket.DialOptions{HTTPHeader: hdr})
+	conn, resp, err := websocket.Dial(dctx, o.URL, nil)
 	if err != nil {
 		if resp != nil {
 			return nil, fmt.Errorf("connect to %s: %s", o.URL, resp.Status)
@@ -83,8 +77,13 @@ func Dial(ctx context.Context, o Options) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("connect to %s: %w", o.URL, err)
 	}
 
-	// The destination travels as the first message on the tunnel, so
-	// it never appears in the request line or headers.
+	// The key and the destination travel as the first two messages on
+	// the tunnel, so neither ever appears in the request line, headers
+	// or reverse-proxy access logs.
+	if err := conn.Write(dctx, websocket.MessageBinary, []byte(o.Key)); err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "")
+		return nil, fmt.Errorf("send key: %w", err)
+	}
 	if err := conn.Write(dctx, websocket.MessageBinary, []byte(dest.Join(o.Host, o.Port))); err != nil {
 		_ = conn.Close(websocket.StatusInternalError, "")
 		return nil, fmt.Errorf("send destination: %w", err)

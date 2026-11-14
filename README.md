@@ -12,17 +12,18 @@ no multiplexing, no re-encoding. A tunnel is a transparent byte pipe.
 ## Features
 
 - **WebSocket transport** over any reverse proxy.
-- **Shared security key**, sent in the `X-Gotunnel-Key` header and
-  compared in constant time.
+- **Shared security key**, sent as the first WebSocket message after
+  the upgrade and compared in constant time — never an HTTP header, so
+  it cannot leak into request logs.
 - **One YAML config per server instance**: TCP listen address, key,
   optional destination allowlist, timeouts, concurrency limit.
 - **Client mode `http`**: a local HTTP proxy supporting `CONNECT` and
   plain-HTTP absolute-URI requests.
 - **Client mode `ssh`**: bridges stdin/stdout for use as an ssh
   `ProxyCommand`.
-- **Destinations never cross the HTTP layer**: the tunnel target is
-  sent as the first message after the WebSocket upgrade, keeping it out
-  of request URLs, headers and access logs.
+- **Neither the key nor destinations cross the HTTP layer**: both are
+  sent as the first two messages after the WebSocket upgrade, keeping
+  them out of request URLs, headers and access logs.
 
 ## Build
 
@@ -73,14 +74,17 @@ with `--key` or the `GOTUNNEL_KEY` environment variable.
 
 ### Protocol
 
-After the upgrade, the client sends exactly one binary message holding
-the tunnel destination (`host`, `host:port` or `[v6-host]:port`; the
-port defaults to 80 when omitted). The server validates it against its
-optional `allow` list **before** dialing: an invalid or not-allowed
-destination is rejected immediately with the reason. Otherwise it dials
-the target and replies with a single message only once the connection
-is up: `ok` on success, or the failure reason followed by a close
-frame (`destination not allowed`, `upstream dial failed: ...`). The
+After the upgrade, the client sends two binary messages: the shared
+key, then the tunnel destination (`host`, `host:port` or
+`[v6-host]:port`; the port defaults to 80 when omitted). The server
+compares the key in constant time — a missing, wrong or malformed key
+gets the same opaque `unauthorized` rejection followed by a close
+frame. The destination is validated against the optional `allow` list
+**before** dialing: an invalid or not-allowed destination is rejected
+immediately with the reason. Otherwise the server dials the target and
+replies with a single message only once the connection is up: `ok` on
+success, or the failure reason followed by a close frame
+(`destination not allowed`, `upstream dial failed: ...`). The
 remaining messages are then relayed as a transparent byte pipe.
 
 Because the client's dial waits for that message, a rejected or
@@ -131,6 +135,6 @@ not appear in `ps` output.)
   do not drop idle tunnels. During a tunnel handshake the server is
   busy dialing the target and nothing flows yet; keep `dial_timeout`
   modest if the reverse proxy in front has a short idle timeout.
-- Tunnel destinations are sent as the first message on the WebSocket
-  after the upgrade, so they never appear in the request URL, request
-  headers, or reverse-proxy access logs.
+- The shared key and tunnel destinations are sent as the first two
+  messages on the WebSocket after the upgrade, so neither appears in
+  the request URL, request headers, or reverse-proxy access logs.

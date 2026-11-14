@@ -7,9 +7,9 @@ Guidance for AI coding agents working in this repository.
 `gotunnel` is a minimal wstunnel-like tool in Go: it tunnels TCP
 connections over WebSockets and is designed to sit behind a reverse
 proxy (Caddy/Nginx) that terminates TLS. One binary, two subcommands
-(`server`, `client`). See `README.md` for usage and
-`docs/initial-plan.md` (or `initial-plan.md` at the root) for the
-original design and decision history.
+(`server`, `client`). See `README.md` for usage and GitHub issue #1
+for the design and decision history — plans live as GitHub issues,
+not in the repository.
 
 ## Commands
 
@@ -48,7 +48,8 @@ No linters or code generators are configured; stdlib + two deps only
 
 ## Locked-in design decisions
 
-Do not change these without updating the plan docs and the README:
+Do not change these without updating the plan issue (#1) and the
+README:
 
 - **One WebSocket per tunneled connection.** No stream multiplexing; a
   tunnel is a transparent byte pipe (32 KiB binary messages).
@@ -58,18 +59,23 @@ Do not change these without updating the plan docs and the README:
   configurable via the config's `listen` key). Non-loopback addresses
   expose the endpoint beyond localhost; the shared key remains the
   access control.
-- **Auth**: `X-Gotunnel-Key` header, sha256-hashed then
-  constant-time-compared. Same error for missing vs. wrong key.
-- **Destination** is sent by the client as the first WebSocket message
-  after the upgrade (`host`, `host:port` or `[v6]:port`; default port
-  80) — never in the handshake URL or headers. Constrained by the
+- **Auth**: the shared key is sent as the **first WebSocket message**
+  after the upgrade (never an HTTP header or URL part), sha256-hashed
+  then constant-time-compared. A missing, wrong or malformed key gets
+  the same opaque `unauthorized` rejection.
+- **Destination** is sent by the client as the **second** WebSocket
+  message after the upgrade, right after the key (`host`, `host:port`
+  or `[v6]:port`; default port 80) — never in the handshake URL or
+  headers. Constrained by the
   optional `allow` glob list (checked after the upgrade, before
   dialing). The server replies with a single `ok` message only after
   the upstream dial succeeds; any other message carries the reason the
-  tunnel was not established (policy rejection or dial failure,
-  including the cause) and is followed by a close frame
+  tunnel was not established (auth failure, policy rejection or dial
+  failure, including the cause) and is followed by a close frame
   (`tunnel.AckOK` is the shared framing constant). Client handshake
-  timeouts must exceed the server's `dial_timeout`.
+  timeouts must exceed the server's `dial_timeout`. If the client
+  never sends the key or destination, the server closes the tunnel
+  after ~5 s with the same failure treatment.
 - **Teardown semantics**: in `tunnel.Pump`, the first direction to
   finish tears the tunnel down (WS has no half-close). Keepalive pings
   (30 s) protect against idle reverse-proxy drops.

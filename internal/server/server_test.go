@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -54,35 +53,38 @@ func newTestServer(t *testing.T, cfg config.ServerConfig) string {
 	return "ws" + strings.TrimPrefix(ts.URL, "http")
 }
 
-// dialTunnel performs the WebSocket handshake (key only — the
-// destination never travels in the HTTP request), sends address as the
-// first post-upgrade message and waits for the server's ack. It
-// returns the ack message (nil if no message arrived before an error).
-func dialTunnel(t *testing.T, url, key, address string) (*websocket.Conn, *http.Response, []byte, error) {
+// dialTunnel performs the WebSocket handshake and the tunnel
+// handshake: the first message carries the key, the second the
+// destination (empty key or address skips that message). It returns
+// the first message the server sends — the ack on success, or the
+// rejection reason.
+func dialTunnel(t *testing.T, url, key, address string) (*websocket.Conn, []byte, error) {
 	t.Helper()
 	// Wide enough for a missing-destination test, where the server
 	// only gives up on the destination message after destWait.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	hdr := http.Header{}
-	if key != "" {
-		hdr.Set("X-Gotunnel-Key", key)
-	}
-	conn, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: hdr})
+	conn, _, err := websocket.Dial(ctx, url, nil)
 	if err != nil {
-		return nil, resp, nil, err
+		return nil, nil, err
+	}
+	if key != "" {
+		if err := conn.Write(ctx, websocket.MessageBinary, []byte(key)); err != nil {
+			_ = conn.CloseNow()
+			return conn, nil, err
+		}
 	}
 	if address != "" {
 		if err := conn.Write(ctx, websocket.MessageBinary, []byte(address)); err != nil {
 			_ = conn.CloseNow()
-			return conn, resp, nil, err
+			return conn, nil, err
 		}
 	}
 	_, ack, err := conn.Read(ctx)
 	if err != nil {
-		return conn, resp, nil, err
+		return conn, nil, err
 	}
-	return conn, resp, ack, nil
+	return conn, ack, nil
 }
 
 // readClose reads until the server's close frame arrives and returns
@@ -129,7 +131,7 @@ func TestEndToEndEcho(t *testing.T) {
 	host, port := echoTarget(t)
 	url := newTestServer(t, config.ServerConfig{Key: "secret"})
 
-	conn, _, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
+	conn, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -153,21 +155,45 @@ func TestEndToEndEcho(t *testing.T) {
 }
 
 func TestBadKeyRejected(t *testing.T) {
-	host, port := echoTarget(t)
 	url := newTestServer(t, config.ServerConfig{Key: "secret"})
 
-	if _, resp, _, err := dialTunnel(t, url, "wrong", net.JoinHostPort(host, strconv.Itoa(port))); err == nil {
-		t.Fatal("expected dial failure")
-	} else if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %v", resp)
+	// The upgrade succeeds; the wrong key yields the same opaque
+	// rejection as a missing one, followed by a close frame.
+	conn, ack, err := dialTunnel(t, url, "wrong", "127.0.0.1:80")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	if string(ack) != "unauthorized" {
+		t.Fatalf("expected %q, got %q", "unauthorized", ack)
+	}
+	if ce := readClose(t, conn); ce.Code != websocket.StatusPolicyViolation {
+		t.Fatalf("expected close status %d, got %d", websocket.StatusPolicyViolation, ce.Code)
+	}
+}
+
+func TestMissingKeyRejected(t *testing.T) {
+	url := newTestServer(t, config.ServerConfig{Key: "secret"})
+
+	// No key message at all: same opaque rejection as a wrong key.
+	conn, ack, err := dialTunnel(t, url, "", "127.0.0.1:80")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	if string(ack) != "unauthorized" {
+		t.Fatalf("expected %q, got %q", "unauthorized", ack)
+	}
+	if ce := readClose(t, conn); ce.Code != websocket.StatusPolicyViolation {
+		t.Fatalf("expected close status %d, got %d", websocket.StatusPolicyViolation, ce.Code)
 	}
 }
 
 func TestMissingDestClosed(t *testing.T) {
 	url := newTestServer(t, config.ServerConfig{Key: "secret"})
-	// The upgrade succeeds; the missing destination is reported as a
+	// The key authenticates; the missing destination is reported as a
 	// rejection message followed by a close frame.
-	conn, _, ack, err := dialTunnel(t, url, "secret", "")
+	conn, ack, err := dialTunnel(t, url, "secret", "")
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -191,7 +217,7 @@ func TestDialFailureReported(t *testing.T) {
 	ln.Close()
 
 	url := newTestServer(t, config.ServerConfig{Key: "secret"})
-	conn, _, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	conn, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -218,7 +244,7 @@ func TestAllowlist(t *testing.T) {
 	})
 
 	// Not matching the allowlist -> rejection message + close frame.
-	conn, _, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
+	conn, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -235,7 +261,7 @@ func TestAllowlist(t *testing.T) {
 		Key:   "secret",
 		Allow: []string{"127.0.0.1:*"},
 	})
-	conn2, _, ack2, err := dialTunnel(t, url2, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
+	conn2, ack2, err := dialTunnel(t, url2, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

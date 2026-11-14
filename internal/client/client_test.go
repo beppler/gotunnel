@@ -84,19 +84,24 @@ func trustTestCert(t *testing.T, ts *httptest.Server) {
 func newFakeTunnel(t *testing.T, key string, handle func(ctx context.Context, conn *websocket.Conn)) string {
 	t.Helper()
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(AuthHeader) != key {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true, // clients are not browsers
 		})
 		if err != nil {
 			return
 		}
+		// The shared key arrives as the first WebSocket message; a
+		// missing, wrong or malformed key gets the same rejection as
+		// the real server's.
+		ctx := context.Background()
+		ktyp, kdata, err := conn.Read(ctx)
+		if err != nil || ktyp != websocket.MessageBinary || string(kdata) != key {
+			rejectTunnel(ctx, conn, errors.New("unauthorized"))
+			return
+		}
 		// The handler runs for the tunnel's lifetime; the request
 		// context would be canceled as soon as ServeHTTP returns.
-		handle(context.Background(), conn)
+		handle(ctx, conn)
 	}))
 	trustTestCert(t, ts)
 	t.Cleanup(ts.Close)
