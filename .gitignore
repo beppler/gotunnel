@@ -11,7 +11,7 @@
 *.dll
 *.so
 *.dylib
-gotunnel
+/gotunnel
 
 # Test binary, built with `go test -c`
 *.test
