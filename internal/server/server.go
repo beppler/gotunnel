@@ -9,7 +9,6 @@ import (
 	"path"
 
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -122,35 +121,37 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // already running, so either the read completes first (and the timer
 // stays silent) or the timer fires first (and the read abandons the
 // handshake) — exactly one side owns the connection.
+//
+// Ownership is a single CompareAndSwap on state, so it holds without
+// a lock: exactly one side flips undecided, and the winner acts on
+// the connection while the loser returns without blocking — even
+// while the timer's reject is still writing to the connection.
 type handshakeGate struct {
-	mu       sync.Mutex
-	complete bool // conn.Read returned
-	rejected bool // the timer fired before the read
+	state atomic.Int32 // gateUndecided, gateReadWon or gateTimerWon
 }
 
-// completeRead records that conn.Read returned. It reports whether
-// the handshake may proceed (false: the timer fired first and owns
-// the rejection and the close).
+const (
+	gateUndecided int32 = iota
+	gateReadWon         // conn.Read returned and claimed the handshake
+	gateTimerWon        // the timer fired first; owns the rejection and the close
+)
+
+// completeRead claims the handshake for the read. It must be called
+// at most once. It reports whether the handshake may proceed (false:
+// the timer won the gate and owns the rejection and the close).
 func (g *handshakeGate) completeRead() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.rejected {
-		return false
-	}
-	g.complete = true
-	return true
+	return g.state.CompareAndSwap(gateUndecided, gateReadWon)
 }
 
-// fire runs reject if — and only if — the read has not completed:
-// the rejection and its close frame still originate from the timer
-// side, which keeps the close handshake intact (see readHandshake).
+// fire runs reject if — and only if — the timer wins the flip from
+// undecided: the rejection and its close frame still originate from
+// the timer side, which keeps the close handshake intact (see
+// readHandshake). reject runs after the CAS, so nothing is held
+// across it. Later calls are no-ops.
 func (g *handshakeGate) fire(reject func()) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.complete || g.rejected {
+	if !g.state.CompareAndSwap(gateUndecided, gateTimerWon) {
 		return
 	}
-	g.rejected = true
 	reject()
 }
 
@@ -172,10 +173,10 @@ func (s *Server) readHandshake(conn *websocket.Conn) (host string, port int, err
 
 	typ, data, err := conn.Read(context.Background())
 	if !g.completeRead() {
-		// The destWait timer fired while we were reading: it owns
-		// the rejection and the close frame. The follow-up reject
-		// from serveHTTP lands on the already closed connection
-		// and fails silently.
+		// The destWait timer fired while we were reading: it won
+		// the gate and owns the rejection and the close frame.
+		// The follow-up reject from serveHTTP carries the same
+		// bytes and fails silently on the closing connection.
 		return "", 0, errUnauthorized
 	}
 	if err != nil || typ != websocket.MessageBinary {
