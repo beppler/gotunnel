@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -316,5 +318,70 @@ func TestAllowlist(t *testing.T) {
 	}
 	if _, _, err := conn2.Read(ctx); err != nil {
 		t.Fatalf("read: %v", err)
+	}
+}
+
+// The tests below drive the handshake gate directly (issue #5): the
+// destWait window itself is far too narrow to hit in an integration
+// test.
+
+func TestHandshakeGateReadWins(t *testing.T) {
+	var fired int
+	g := &handshakeGate{}
+	if !g.completeRead() {
+		t.Fatal("read lost before the timer fired")
+	}
+	for i := 0; i < 2; i++ {
+		g.fire(func() { fired++ })
+	}
+	if fired != 0 {
+		t.Fatalf("timer rejected a completed handshake %d time(s)", fired)
+	}
+}
+
+func TestHandshakeGateTimerWins(t *testing.T) {
+	var fired int
+	g := &handshakeGate{}
+	g.fire(func() { fired++ })
+	if fired != 1 {
+		t.Fatalf("timer fired %d time(s), want 1", fired)
+	}
+	if g.completeRead() {
+		t.Fatal("handshake proceeded after the timer rejected it")
+	}
+	g.fire(func() { fired++ })
+	if fired != 1 {
+		t.Fatalf("rejection ran %d time(s), want 1", fired)
+	}
+}
+
+func TestHandshakeGateRace(t *testing.T) {
+	// Fire and read concurrently: whichever side wins, the outcome
+	// is exclusive — the rejection runs at most once, and the read
+	// completes the handshake only when no rejection ran.
+	for i := 0; i < 1000; i++ {
+		var (
+			fired  atomic.Int64
+			readOK bool
+			wg     sync.WaitGroup
+		)
+		g := &handshakeGate{}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			g.fire(func() { fired.Add(1) })
+		}()
+		go func() {
+			defer wg.Done()
+			readOK = g.completeRead()
+		}()
+		wg.Wait()
+
+		switch {
+		case readOK && fired.Load() != 0:
+			t.Fatalf("iteration %d: handshake completed but reject ran %d time(s)", i, fired.Load())
+		case !readOK && fired.Load() != 1:
+			t.Fatalf("iteration %d: read lost but reject ran %d time(s)", i, fired.Load())
+		}
 	}
 }

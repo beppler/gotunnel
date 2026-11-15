@@ -9,6 +9,7 @@ import (
 	"path"
 
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -115,6 +116,44 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	tunnel.Pump(ctx, conn, ac)
 }
 
+// handshakeGate arbitrates the destWait timer against the handshake
+// read, so a rejection can never be written onto a connection whose
+// handshake just completed: t.Stop cannot un-fire a callback that is
+// already running, so either the read completes first (and the timer
+// stays silent) or the timer fires first (and the read abandons the
+// handshake) — exactly one side owns the connection.
+type handshakeGate struct {
+	mu       sync.Mutex
+	complete bool // conn.Read returned
+	rejected bool // the timer fired before the read
+}
+
+// completeRead records that conn.Read returned. It reports whether
+// the handshake may proceed (false: the timer fired first and owns
+// the rejection and the close).
+func (g *handshakeGate) completeRead() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.rejected {
+		return false
+	}
+	g.complete = true
+	return true
+}
+
+// fire runs reject if — and only if — the read has not completed:
+// the rejection and its close frame still originate from the timer
+// side, which keeps the close handshake intact (see readHandshake).
+func (g *handshakeGate) fire(reject func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.complete || g.rejected {
+		return
+	}
+	g.rejected = true
+	reject()
+}
+
 // readHandshake reads the single post-upgrade message: a JSON object
 // carrying the destination and an HMAC-SHA256 signature over it,
 // keyed by the shared key — so the key itself never crosses the wire.
@@ -127,10 +166,18 @@ func (s *Server) readHandshake(conn *websocket.Conn) (host string, port int, err
 	// A client that never sends the handshake message gets the same
 	// opaque rejection; closing from a timer (instead of canceling
 	// the read context) keeps the close handshake intact.
-	t := time.AfterFunc(destWait, func() { s.reject(conn, errUnauthorized) })
+	g := &handshakeGate{}
+	t := time.AfterFunc(destWait, func() { g.fire(func() { s.reject(conn, errUnauthorized) }) })
 	defer t.Stop()
 
 	typ, data, err := conn.Read(context.Background())
+	if !g.completeRead() {
+		// The destWait timer fired while we were reading: it owns
+		// the rejection and the close frame. The follow-up reject
+		// from serveHTTP lands on the already closed connection
+		// and fails silently.
+		return "", 0, errUnauthorized
+	}
 	if err != nil || typ != websocket.MessageBinary {
 		return "", 0, errUnauthorized
 	}
