@@ -77,35 +77,6 @@ tunnel.example.com {
 The client accepts only `wss://` URLs. The security key can be passed
 with `--key` or the `GOTUNNEL_KEY` environment variable.
 
-### Protocol
-
-After the upgrade, the client sends a single binary message — a JSON
-object carrying the tunnel destination and an HMAC-SHA256 signature of
-the canonical `host:port` address, keyed by the shared key:
-
-```json
-{"v":1,"host":"db.internal.example","port":22,"sig":"<64 hex chars>"}
-```
-
-The key itself is never transmitted: the server only verifies the
-signature, in constant time. A missing, malformed, wrong-version or
-wrongly signed message gets the same opaque `unauthorized` rejection
-followed by a close frame. The destination is validated against the
-optional `allow` list **before** dialing: an invalid or not-allowed
-destination is rejected immediately with the reason. Otherwise the
-server dials the target and replies with a single message only once
-the connection is up: `ok` on success, or the failure reason followed
-by a close frame (`destination not allowed`, `upstream dial failed:
-...`). The remaining messages are then relayed as a transparent byte
-pipe.
-
-Because the client's dial waits for that message, a rejected or
-undialable destination fails synchronously with a readable error (the
-HTTP proxy answers `502 <reason>`; ssh ProxyCommand prints it on
-stderr). The handshake therefore includes the upstream dial:
-`--connect-timeout` (default 30s) must exceed the server's
-`dial_timeout` (default 10s).
-
 ### HTTP proxy mode
 
 ```shell
@@ -142,6 +113,36 @@ Host bastion
 
 (In practice keep the key in `GOTUNNEL_KEY` rather than `%k` so it does
 not appear in `ps` output.)
+
+## Protocol
+
+After the upgrade, the client sends a single binary message — a JSON
+object carrying the tunnel destination and an HMAC-SHA256 signature of
+the canonical `host:port` address, keyed by the shared key:
+
+```json
+{"v":1,"host":"db.internal.example","port":22,"sig":"<64 hex chars>"}
+```
+
+The key itself is never transmitted: the server only verifies the
+signature, in constant time. A missing, malformed, wrong-version or
+wrongly signed message gets the same opaque `unauthorized` rejection
+followed by a close frame. The destination is validated against the
+optional `allow` list **before** dialing: an invalid or not-allowed
+destination is rejected immediately with the reason. Otherwise the
+server dials the target and replies with a single message only once
+the connection is up: `ok` on success, or the failure reason followed
+by a close frame (`destination not allowed`, `upstream dial failed:
+...`). The remaining messages are then relayed as a transparent byte
+pipe.
+
+Because the client's dial waits for that message, a rejected or
+undialable destination fails synchronously with a readable error (the
+HTTP proxy answers `502 <reason>`; ssh ProxyCommand prints it on
+stderr). The handshake therefore includes the upstream dial:
+`--connect-timeout` (default 30s) must exceed the server's
+`dial_timeout` (default 10s).
+
 
 ## Notes and limits
 
