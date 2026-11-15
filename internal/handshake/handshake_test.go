@@ -74,15 +74,15 @@ func TestVerifyMalformed(t *testing.T) {
 	}
 }
 
-// Verify must not accept a destination whose host part is malformed;
-// host validation is the server's next step, but a syntactically
-// impossible address still fails verification cleanly.
-func TestSignDoesNotCanonicalize(t *testing.T) {
-	// The signature covers exactly what is sent; changing the
-	// rendering of the destination invalidates it.
+// The signature must bind the destination it was made for: a sig over
+// one canonical host:port must not verify for a different host or
+// port. (Tampering a signed message is covered by TestVerifyTampered;
+// malformed hosts are the server's ParseAddress concern, not Verify's.)
+func TestSignBindsDestination(t *testing.T) {
 	m := Sign("example.com", 80, key)
-	other := Sign("example.com", 81, key)
-	if m.Sig == other.Sig {
-		t.Fatal("different destinations must produce different signatures")
+	otherHost := Sign("evil.com", 80, key)
+	otherPort := Sign("example.com", 81, key)
+	if m.Sig == otherHost.Sig || m.Sig == otherPort.Sig {
+		t.Fatal("a signature must not verify for a different destination")
 	}
 }
