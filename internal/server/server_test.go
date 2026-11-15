@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 
 	"gotunnel/internal/config"
+	"gotunnel/internal/dest"
 	"gotunnel/internal/handshake"
 	"gotunnel/internal/tunnel"
 )
@@ -71,9 +72,18 @@ func dialTunnel(t *testing.T, url, key, address string) (*websocket.Conn, []byte
 		return nil, nil, err
 	}
 	if key != "" && address != "" {
-		host, portStr, _ := strings.Cut(address, ":")
-		port, _ := strconv.Atoi(portStr)
-		data, _ := json.Marshal(handshake.Sign(host, port, key))
+		// Parse the address the same way the protocol does, so every
+		// accepted form (host, host:port, [v6]:port) signs correctly.
+		host, port, err := dest.ParseAddress(address, 80)
+		if err != nil {
+			_ = conn.CloseNow()
+			t.Fatalf("dialTunnel: parse address %q: %v", address, err)
+		}
+		data, err := json.Marshal(handshake.Sign(host, port, key))
+		if err != nil {
+			_ = conn.CloseNow()
+			t.Fatalf("dialTunnel: encode handshake message: %v", err)
+		}
 		if err := conn.Write(ctx, websocket.MessageBinary, data); err != nil {
 			_ = conn.CloseNow()
 			return conn, nil, err
