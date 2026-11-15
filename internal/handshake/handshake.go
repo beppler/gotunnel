@@ -66,6 +66,6 @@ func Verify(data []byte, key string) (host string, port int, err error) {
 // mac computes the HMAC-SHA256 over the canonical host:port address.
 func mac(host string, port int, key string) []byte {
 	m := hmac.New(sha256.New, []byte(key))
-	fmt.Fprintf(m, "%s", dest.Join(host, port))
+	m.Write([]byte(dest.Join(host, port)))
 	return m.Sum(nil)
 }
