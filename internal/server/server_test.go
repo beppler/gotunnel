@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,8 +23,11 @@ import (
 )
 
 // echoTarget starts a TCP echo server used as the tunnel destination.
-func echoTarget(t *testing.T) (host string, port int) {
+// It also returns a counter of accepted connections, so tests can
+// assert the destination was never dialed.
+func echoTarget(t *testing.T) (host string, port int, conns *atomic.Int64) {
 	t.Helper()
+	var accepted atomic.Int64
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +38,7 @@ func echoTarget(t *testing.T) (host string, port int) {
 			if err != nil {
 				return
 			}
+			accepted.Add(1)
 			go func() {
 				defer conn.Close()
 				_, _ = io.Copy(conn, conn)
@@ -40,12 +46,13 @@ func echoTarget(t *testing.T) (host string, port int) {
 		}
 	}()
 	t.Cleanup(func() { ln.Close() })
-	return "127.0.0.1", ln.Addr().(*net.TCPAddr).Port
+	return "127.0.0.1", ln.Addr().(*net.TCPAddr).Port, &accepted
 }
 
 // newTestServer starts the server handler behind httptest and returns
-// its ws:// URL.
-func newTestServer(t *testing.T, cfg config.ServerConfig) string {
+// the server — so tests can adjust its knobs, e.g. destWait — along
+// with its ws:// URL.
+func newTestServer(t *testing.T, cfg config.ServerConfig) (*Server, string) {
 	t.Helper()
 	srv, err := New(cfg)
 	if err != nil {
@@ -53,7 +60,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig) string {
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return "ws" + strings.TrimPrefix(ts.URL, "http")
+	return srv, "ws" + strings.TrimPrefix(ts.URL, "http")
 }
 
 // dialTunnel performs the WebSocket handshake and the tunnel
@@ -161,8 +168,8 @@ func expectClose(t *testing.T, conn *websocket.Conn) (websocket.StatusCode, stri
 }
 
 func TestEndToEndEcho(t *testing.T) {
-	host, port := echoTarget(t)
-	url := newTestServer(t, config.ServerConfig{Key: "secret"})
+	host, port, _ := echoTarget(t)
+	_, url := newTestServer(t, config.ServerConfig{Key: "secret"})
 
 	conn, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
@@ -188,7 +195,7 @@ func TestEndToEndEcho(t *testing.T) {
 }
 
 func TestBadKeyRejected(t *testing.T) {
-	url := newTestServer(t, config.ServerConfig{Key: "secret"})
+	_, url := newTestServer(t, config.ServerConfig{Key: "secret"})
 
 	// The upgrade succeeds; a message signed with the wrong key
 	// yields the same opaque rejection as a missing one, followed by
@@ -207,7 +214,7 @@ func TestBadKeyRejected(t *testing.T) {
 }
 
 func TestMissingMessageRejected(t *testing.T) {
-	url := newTestServer(t, config.ServerConfig{Key: "secret"})
+	_, url := newTestServer(t, config.ServerConfig{Key: "secret"})
 
 	// No handshake message at all: same opaque rejection as a
 	// wrongly signed one.
@@ -224,6 +231,67 @@ func TestMissingMessageRejected(t *testing.T) {
 	}
 }
 
+// TestLateMessageRejected exercises readHandshake's lose path
+// end-to-end (issue #5): the destWait timer fires while a valid,
+// correctly signed handshake message is in flight, the gate hands the
+// connection to the timer, and the late message must be abandoned —
+// no rejection other than the timer's, no dial, no ack.
+func TestLateMessageRejected(t *testing.T) {
+	srv, url := newTestServer(t, config.ServerConfig{Key: "secret"})
+	host, port, conns := echoTarget(t)
+	srv.destWait = 50 * time.Millisecond // shrink the window; the sleep below is 10x
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// Stay silent past destWait, so the timer fires and claims the
+	// connection; only then send a valid handshake message.
+	time.Sleep(500 * time.Millisecond)
+	data, err := json.Marshal(handshake.Sign(host, port, "secret"))
+	if err != nil {
+		t.Fatalf("encode handshake: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, data); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+
+	// The rejection — every data message must be the unauthorized
+	// reason (the follow-up reject from serveHTTP may duplicate it) —
+	// followed by the timer-side close.
+	for {
+		typ, msg, err := conn.Read(ctx)
+		if err != nil {
+			var ce websocket.CloseError
+			if !errors.As(err, &ce) {
+				t.Fatalf("expected a close frame, got %v", err)
+			}
+			if ce.Code != websocket.StatusPolicyViolation {
+				t.Fatalf("expected close status %d, got %d", websocket.StatusPolicyViolation, ce.Code)
+			}
+			if ce.Reason != errUnauthorized.Error() {
+				t.Fatalf("expected close reason %q, got %q", errUnauthorized.Error(), ce.Reason)
+			}
+			break
+		}
+		if typ != websocket.MessageBinary || string(msg) != errUnauthorized.Error() {
+			t.Fatalf("expected the unauthorized rejection, got (%v, %q)", typ, msg)
+		}
+	}
+
+	// The gate is consulted before the allowlist and the dial, so a
+	// handshake that lost it must never reach the destination: give
+	// any wiring-ignored dial time to land, then assert none did.
+	time.Sleep(250 * time.Millisecond)
+	if n := conns.Load(); n != 0 {
+		t.Fatalf("destination dialed %d time(s) despite the lost gate", n)
+	}
+}
+
 func TestMalformedMessageRejected(t *testing.T) {
 	for name, payload := range map[string]string{
 		"garbage bytes": "\x00\x01",
@@ -232,7 +300,7 @@ func TestMalformedMessageRejected(t *testing.T) {
 		"not hex":       `{"v":1,"host":"127.0.0.1","port":80,"sig":"zz"}`,
 		"wrong version": `{"v":99,"host":"127.0.0.1","port":80,"sig":"` + strings.Repeat("0", 64) + `"}`,
 	} {
-		url := newTestServer(t, config.ServerConfig{Key: "secret"})
+		_, url := newTestServer(t, config.ServerConfig{Key: "secret"})
 		conn, ack, err := dialRaw(t, url, payload)
 		if err != nil {
 			t.Fatalf("%s: dial: %v", name, err)
@@ -256,7 +324,7 @@ func TestDialFailureReported(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
-	url := newTestServer(t, config.ServerConfig{Key: "secret"})
+	_, url := newTestServer(t, config.ServerConfig{Key: "secret"})
 	conn, ack, err := dialTunnel(t, url, "secret", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -277,8 +345,8 @@ func TestDialFailureReported(t *testing.T) {
 }
 
 func TestAllowlist(t *testing.T) {
-	host, port := echoTarget(t)
-	url := newTestServer(t, config.ServerConfig{
+	host, port, _ := echoTarget(t)
+	_, url := newTestServer(t, config.ServerConfig{
 		Key:   "secret",
 		Allow: []string{"*.example.com:*"},
 	})
@@ -297,7 +365,7 @@ func TestAllowlist(t *testing.T) {
 	}
 
 	// Matching the allowlist -> tunnel works.
-	url2 := newTestServer(t, config.ServerConfig{
+	_, url2 := newTestServer(t, config.ServerConfig{
 		Key:   "secret",
 		Allow: []string{"127.0.0.1:*"},
 	})
@@ -316,5 +384,110 @@ func TestAllowlist(t *testing.T) {
 	}
 	if _, _, err := conn2.Read(ctx); err != nil {
 		t.Fatalf("read: %v", err)
+	}
+}
+
+// The tests below drive the handshake gate and the post-read decision
+// directly (issue #5): the real destWait window is far too narrow to
+// hit in an integration test.
+
+func TestHandshakeGateReadWins(t *testing.T) {
+	var fired int
+	g := &handshakeGate{}
+	if !g.completeRead() {
+		t.Fatal("read lost before the timer fired")
+	}
+	for i := 0; i < 2; i++ {
+		g.fire(func() { fired++ })
+	}
+	if fired != 0 {
+		t.Fatalf("timer rejected a completed handshake %d time(s)", fired)
+	}
+}
+
+func TestHandshakeGateTimerWins(t *testing.T) {
+	var fired int
+	g := &handshakeGate{}
+	g.fire(func() { fired++ })
+	if fired != 1 {
+		t.Fatalf("timer fired %d time(s), want 1", fired)
+	}
+	if g.completeRead() {
+		t.Fatal("handshake proceeded after the timer rejected it")
+	}
+	g.fire(func() { fired++ })
+	if fired != 1 {
+		t.Fatalf("rejection ran %d time(s), want 1", fired)
+	}
+}
+
+func TestHandshakeGateRace(t *testing.T) {
+	// Fire and read concurrently: whichever side wins, the outcome
+	// is exclusive — the rejection runs at most once, and the read
+	// completes the handshake only when no rejection ran.
+	for i := 0; i < 1000; i++ {
+		var (
+			fired  atomic.Int64
+			readOK bool
+			wg     sync.WaitGroup
+		)
+		g := &handshakeGate{}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			g.fire(func() { fired.Add(1) })
+		}()
+		go func() {
+			defer wg.Done()
+			readOK = g.completeRead()
+		}()
+		wg.Wait()
+
+		switch {
+		case readOK && fired.Load() != 0:
+			t.Fatalf("iteration %d: handshake completed but reject ran %d time(s)", i, fired.Load())
+		case !readOK && fired.Load() != 1:
+			t.Fatalf("iteration %d: read lost but reject ran %d time(s)", i, fired.Load())
+		}
+	}
+}
+
+func TestHandshakeAbandonedWhenTimerWon(t *testing.T) {
+	srv, err := New(config.ServerConfig{Key: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(handshake.Sign("127.0.0.1", 80, "secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A read that lost the gate — the timer fired first and owns the
+	// rejection and the close — must be abandoned even when it
+	// returned a valid, correctly signed message: deadline semantics
+	// linearize at read-return.
+	g := &handshakeGate{}
+	g.fire(func() {})
+	if _, _, err := srv.verifyHandshake(g, websocket.MessageBinary, data, nil); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("timer won the gate but the message was processed: %v", err)
+	}
+}
+
+func TestHandshakeVerifiedWhenReadWon(t *testing.T) {
+	srv, err := New(config.ServerConfig{Key: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(handshake.Sign("127.0.0.1", 80, "secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotHost, gotPort, err := srv.verifyHandshake(&handshakeGate{}, websocket.MessageBinary, data, nil)
+	if err != nil {
+		t.Fatalf("read won the gate but the handshake failed: %v", err)
+	}
+	if gotHost != "127.0.0.1" || gotPort != 80 {
+		t.Fatalf("got %s:%d, want 127.0.0.1:80", gotHost, gotPort)
 	}
 }
