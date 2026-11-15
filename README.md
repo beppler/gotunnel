@@ -28,7 +28,9 @@ no multiplexing, no re-encoding. A tunnel is a transparent byte pipe.
 
 ## Build
 
-    go build -o gotunnel ./cmd/gotunnel
+```shell
+go build -o gotunnel ./cmd/gotunnel
+```
 
 ## Server
 
@@ -58,11 +60,13 @@ and rely on the shared key for access control.
 
 Run it (it must sit behind a reverse proxy, which connects over TCP):
 
-    gotunnel server --config server.yaml
+```shell
+gotunnel server --config server.yaml
+```
 
 ### Caddy
 
-```
+```text
 tunnel.example.com {
     reverse_proxy /ws* localhost:2345
 }
@@ -104,28 +108,34 @@ stderr). The handshake therefore includes the upstream dial:
 
 ### HTTP proxy mode
 
-    gotunnel client \
-        --url wss://tunnel.example.com/ws \
-        --key change-me-long-random \
-        --mode http \
-        --listen 127.0.0.1:3128
+```shell
+gotunnel client \
+    --url wss://tunnel.example.com/ws \
+    --key change-me-long-random \
+    --mode http \
+    --listen 127.0.0.1:3128
+```
 
 Use it like any HTTP proxy:
 
-    curl -x http://127.0.0.1:3128 https://ifconfig.me   # via CONNECT
-    curl -x http://127.0.0.1:3128 http://ifconfig.me    # via absolute-URI
+```shell
+curl -x http://127.0.0.1:3128 https://ifconfig.me   # via CONNECT
+curl -x http://127.0.0.1:3128 http://ifconfig.me    # via absolute-URI
+```
 
 ### ssh ProxyCommand mode
 
-    gotunnel client \
-        --url wss://tunnel.example.com/ws \
-        --key change-me-long-random \
-        --mode ssh \
-        --host 10.0.0.5:22
+```shell
+gotunnel client \
+    --url wss://tunnel.example.com/ws \
+    --key change-me-long-random \
+    --mode ssh \
+    --host 10.0.0.5:22
+```
 
 Configure ssh:
 
-```
+```text
 Host bastion
     ProxyCommand gotunnel client --url wss://tunnel.example.com/ws --mode ssh --host 10.0.0.5:22 --key %k
 ```
