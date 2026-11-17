@@ -1,4 +1,4 @@
-module gotunnel
+module go.beppler.dev.br/gotunnel
 
 go 1.27.4
 
