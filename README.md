@@ -158,3 +158,7 @@ stderr). The handshake therefore includes the upstream dial:
   the WebSocket right after the upgrade, and the shared key is never
   sent at all (it only signs the message), so neither appears in the
   request URL, request headers, or reverse-proxy access logs.
+
+## License
+
+[MIT](LICENSE)
