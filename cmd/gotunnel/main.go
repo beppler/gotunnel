@@ -37,9 +37,9 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "server":
-		runServer(os.Args[2:])
+		os.Exit(runServer(os.Args[2:]))
 	case "client":
-		runClient(os.Args[2:])
+		os.Exit(runClient(os.Args[2:]))
 	case "help", "-h", "--help":
 		usage()
 	default:
