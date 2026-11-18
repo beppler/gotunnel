@@ -8,7 +8,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gotunnel/internal/tunnel"
+	"go.beppler.dev.br/gotunnel/internal/tunnel"
 )
 
 // stdioTarget bridges a process's stdin/stdout to the tunnel for ssh

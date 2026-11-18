@@ -23,9 +23,9 @@ import (
 	"syscall"
 	"time"
 
-	"gotunnel/internal/client"
-	"gotunnel/internal/config"
-	"gotunnel/internal/server"
+	"go.beppler.dev.br/gotunnel/internal/client"
+	"go.beppler.dev.br/gotunnel/internal/config"
+	"go.beppler.dev.br/gotunnel/internal/server"
 )
 
 const defaultSSHPort = 22

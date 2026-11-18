@@ -13,8 +13,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gotunnel/internal/dest"
-	"gotunnel/internal/tunnel"
+	"go.beppler.dev.br/gotunnel/internal/dest"
+	"go.beppler.dev.br/gotunnel/internal/tunnel"
 )
 
 const defaultBufferedBody = 10 << 20 // 10 MiB

@@ -16,10 +16,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"gotunnel/internal/config"
-	"gotunnel/internal/dest"
-	"gotunnel/internal/handshake"
-	"gotunnel/internal/tunnel"
+	"go.beppler.dev.br/gotunnel/internal/config"
+	"go.beppler.dev.br/gotunnel/internal/dest"
+	"go.beppler.dev.br/gotunnel/internal/handshake"
+	"go.beppler.dev.br/gotunnel/internal/tunnel"
 )
 
 // echoTarget starts a TCP echo server used as the tunnel destination.

@@ -12,7 +12,7 @@ import (
 	"errors"
 	"fmt"
 
-	"gotunnel/internal/dest"
+	"go.beppler.dev.br/gotunnel/internal/dest"
 )
 
 // Version is the protocol version of the handshake message; the
