@@ -19,12 +19,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
 	"go.beppler.dev.br/gotunnel/internal/client"
 	"go.beppler.dev.br/gotunnel/internal/config"
+	"go.beppler.dev.br/gotunnel/internal/dest"
 	"go.beppler.dev.br/gotunnel/internal/server"
 )
 
@@ -172,7 +172,7 @@ func runClient(args []string) int {
 		return 0
 
 	case "ssh":
-		host, port, err := parseDestFlag(*hostFlag)
+		host, port, err := dest.ParseAddress(*hostFlag, defaultSSHPort)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gotunnel client: --host: %v\n", err)
 			return 2
@@ -188,21 +188,4 @@ func runClient(args []string) int {
 		fmt.Fprintf(os.Stderr, "gotunnel client: unknown --mode %q (want http or ssh)\n", *mode)
 		return 2
 	}
-}
-
-// parseDestFlag parses a "host:port" flag, defaulting the port for ssh
-// destinations.
-func parseDestFlag(s string) (string, int, error) {
-	host, portStr, err := net.SplitHostPort(s)
-	if err != nil {
-		host, portStr = s, strconv.Itoa(defaultSSHPort)
-	}
-	if host == "" {
-		return "", 0, fmt.Errorf("missing host in %q", s)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return "", 0, fmt.Errorf("invalid port in %q", s)
-	}
-	return host, port, nil
 }
