@@ -234,9 +234,12 @@ func (s *Server) destAllowed(host string, port int) bool {
 	if s.cfg.Allow == nil {
 		return true
 	}
-	target := strings.ToLower(fmt.Sprintf("%s:%d", host, port))
+	target := strings.ToLower(dest.Join(host, port))
+	// Escape [ ] so path.Match does not read an IPv6 literal in the
+	// pattern ("[::1]:*") as a character class.
 	for _, pattern := range s.cfg.Allow {
-		if ok, _ := path.Match(strings.ToLower(pattern), target); ok {
+		escaped := strings.ReplaceAll(strings.ReplaceAll(strings.ToLower(pattern), "[", `\[`), "]", `\]`)
+		if ok, _ := path.Match(escaped, target); ok {
 			return true
 		}
 	}
