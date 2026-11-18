@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 const key = "secret"
@@ -49,6 +50,7 @@ func TestVerifyTampered(t *testing.T) {
 		"host":    func(m *Message) { m.Host = "evil.com" },
 		"port":    func(m *Message) { m.Port = 8080 },
 		"version": func(m *Message) { m.Version = Version + 1 },
+		"ts":      func(m *Message) { m.TS++ },
 		"sig":     func(m *Message) { m.Sig = strings.Repeat("0", 64) },
 	} {
 		tampered := m
@@ -64,12 +66,32 @@ func TestVerifyMalformed(t *testing.T) {
 	for name, data := range map[string]string{
 		"not json":    "\x00\x01",
 		"empty":       "",
-		"not hex":     `{"v":1,"host":"h","port":80,"sig":"zz"}`,
+		"not hex":     `{"v":1,"host":"h","port":80,"ts":1,"sig":"zz"}`,
 		"no version":  `{"host":"h","port":80,"sig":"` + strings.Repeat("0", 64) + `"}`,
 		"missing sig": `{"v":1,"host":"h","port":80}`,
 	} {
 		if _, _, err := Verify([]byte(data), key); err == nil {
 			t.Errorf("%s: expected verification to fail", name)
+		}
+	}
+}
+
+func TestVerifyStaleTimestamp(t *testing.T) {
+	now := time.Now().Unix()
+	for name, ts := range map[string]int64{
+		"too old":       now - 61,
+		"too far ahead": now + 61,
+	} {
+		data, _ := json.Marshal(signAt("example.com", 80, key, ts))
+		if _, _, err := Verify(data, key); err == nil {
+			t.Errorf("%s: expected verification to fail", name)
+		}
+	}
+	// Inside the ±maxSkew window the message verifies.
+	for _, ts := range []int64{now - 59, now, now + 59} {
+		data, _ := json.Marshal(signAt("example.com", 80, key, ts))
+		if _, _, err := Verify(data, key); err != nil {
+			t.Errorf("ts %d: expected verification to succeed: %v", ts, err)
 		}
 	}
 }

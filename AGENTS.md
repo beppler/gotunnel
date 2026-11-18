@@ -63,12 +63,16 @@ README:
   access control.
 - **Auth + destination in one signed message.** The client sends a
   **single** JSON message right after the upgrade:
-  `{"v":1,"host":...,"port":...,"sig":...}` where `sig` is
-  `hex(HMAC-SHA256(key, "host:port"))` (`internal/handshake`). The
-  key itself is **never** transmitted; the server verifies the HMAC
-  in constant time (`hmac.Equal`). A missing, malformed,
-  wrong-version or wrongly signed message gets the same opaque
-  `unauthorized` rejection.
+  `{"v":1,"host":...,"port":...,"ts":...,"sig":...}` where `sig` is
+  `hex(HMAC-SHA256(key, "gotunnel-handshake-v1:host:port:ts"))`
+  (`internal/handshake`); `ts` is unix seconds. The version is bound
+  into the MAC via the `gotunnel-handshake-v1:` domain prefix. The
+  server rejects timestamps more than one minute away from its clock
+  (either direction), so a captured handshake is only replayable for
+  ~1 minute. The key itself is **never** transmitted; the server
+  verifies the HMAC in constant time (`hmac.Equal`). A missing,
+  malformed, wrong-version, stale or wrongly signed message gets the
+  same opaque `unauthorized` rejection.
 - **Destination** travels inside that signed message (`host`,
   `host:port` or `[v6]:port`; default port 80) — never in the
   handshake URL or headers. Constrained by the optional `allow` glob

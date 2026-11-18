@@ -117,16 +117,22 @@ not appear in `ps` output.)
 ## Protocol
 
 After the upgrade, the client sends a single binary message — a JSON
-object carrying the tunnel destination and an HMAC-SHA256 signature of
-the canonical `host:port` address, keyed by the shared key:
+object carrying the tunnel destination, a unix timestamp and an
+HMAC-SHA256 signature of the `gotunnel-handshake-v1:` prefix followed
+by the canonical `host:port` address and the timestamp, keyed by the
+shared key:
 
 ```json
-{"v":1,"host":"db.internal.example","port":22,"sig":"<64 hex chars>"}
+{"v":1,"host":"db.internal.example","port":22,"ts":1735689600,"sig":"<64 hex chars>"}
 ```
 
 The key itself is never transmitted: the server only verifies the
-signature, in constant time. A missing, malformed, wrong-version or
-wrongly signed message gets the same opaque `unauthorized` rejection
+signature, in constant time. A message whose timestamp is more than
+one minute away from the server's clock (in either direction, to
+absorb client clock skew) is rejected, so a captured handshake can
+only be replayed for about a minute. A missing, malformed, wrong-version,
+wrongly signed or stale message gets the same opaque `unauthorized`
+rejection
 followed by a close frame. The destination is validated against the
 optional `allow` list **before** dialing: an invalid or not-allowed
 destination is rejected immediately with the reason. Otherwise the
