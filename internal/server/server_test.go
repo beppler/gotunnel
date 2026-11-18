@@ -387,6 +387,22 @@ func TestAllowlist(t *testing.T) {
 	}
 }
 
+func TestDestAllowedIPv6(t *testing.T) {
+	// The match string must use the bracketed form dest.Join renders
+	// for IPv6 hosts (issue #16).
+	s := &Server{cfg: config.ServerConfig{Allow: []string{"[::1]:*"}}}
+	if !s.destAllowed("::1", 22) {
+		t.Fatal("[::1]:* should match IPv6 host ::1 port 22")
+	}
+	if s.destAllowed("::2", 22) {
+		t.Fatal("[::1]:* should not match a different host")
+	}
+	s2 := &Server{cfg: config.ServerConfig{Allow: nil}}
+	if !s2.destAllowed("::1", 22) {
+		t.Fatal("nil allowlist permits everything")
+	}
+}
+
 // The tests below drive the handshake gate and the post-read decision
 // directly (issue #5): the real destWait window is far too narrow to
 // hit in an integration test.

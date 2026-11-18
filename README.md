@@ -44,6 +44,7 @@ key: change-me-long-random
 allow:
   - "*.internal.example:22"
   - "db.local:*"
+  - "[::1]:*"   # IPv6: bracketed form, as dialed
 dial_timeout: 10s
 # idle_timeout: 5m        # close tunnels idle for this long (off by default)
 # max_concurrent: 100     # limit concurrent tunnels (unlimited by default)
